@@ -14,7 +14,6 @@ module AppStoreServerApi
       bundle_id:,   # Your app’s bundle ID (Ex: “com.example.testbundleid”)
       environment: :production
     )
-
       @private_key = private_key
       @key_id = key_id
       @issuer_id = issuer_id
@@ -121,7 +120,6 @@ module AppStoreServerApi
       alg: "ES256",
       typ: "JWT"
     )
-
       payload = {
         iss: issuer_id,
         iat: issued_at,

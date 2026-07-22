@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    app_store_server_api (0.1.1)
+    app_store_server_api (0.2.0)
       jwt (~> 2.8)
 
 GEM

@@ -11,7 +11,9 @@ RSpec.describe AppStoreServerApi do
     )
   end
 
-  describe "API" do
+  # These exercise the live Apple App Store Server API and require real
+  # credentials (and network access), so they only run when configured.
+  describe "API", if: ENV["private_key"] && ENV["transaction_id"] do
     it "request_a_test_notification API" do
       data = client.request_a_test_notification
       expect(data["testNotificationToken"]).not_to be_nil

@@ -8,6 +8,14 @@ A Ruby client for the [App Store Server API](https://developer.apple.com/documen
 
 [![Gem Version](https://badge.fury.io/rb/app_store_server_api.svg)](https://badge.fury.io/rb/app_store_server_api)
 
+> **Fork notice.** This is the `invest-with-roots` maintained fork of the
+> MIT-licensed [`mnyify/app_store_server_api`](https://github.com/mnyify/app_store_server_api),
+> forked from base commit
+> [`5c4cb97c9ac9445a308e726652220aa0a61fae83`](https://github.com/mnyify/app_store_server_api/commit/5c4cb97c9ac9445a308e726652220aa0a61fae83).
+> The upstream MIT license and attribution are preserved in `LICENSE.txt`. JWS
+> verification has been hardened to match Apple's official verifier — see
+> [JWS verification](#jws-verification).
+
 ## Features
 * Transaction history, transaction info, and subscription status endpoints
 * Test notification and notification history endpoints
@@ -121,8 +129,41 @@ client.request_a_test_notification
 **Utils**
 
 - AppStoreServerApi::Utils::Decoder.decode_transaction
+- AppStoreServerApi::Utils::Decoder.decode_transactions
+- AppStoreServerApi::Utils::Decoder.decode_notification
 - AppStoreServerApi::Utils::Decoder.decode_jws!
 
+## JWS verification
+
+`Utils::Decoder` verifies the JWS payloads returned by the App Store Server API
+and App Store Server Notifications using the same semantics as Apple's official
+libraries (ported from the MIT-licensed
+[`apple/app-store-server-library-python`](https://github.com/apple/app-store-server-library-python)
+/ [`-node`](https://github.com/apple/app-store-server-library-node)). A payload
+is trusted only when:
+
+1. Its `x5c` header carries a chain of exactly three certificates.
+2. That chain builds and validates up to a bundled, trusted Apple root CA, with
+   each certificate's validity window evaluated at the payload's `signedDate`.
+3. The leaf carries Apple's leaf marker OID (`1.2.840.113635.100.6.11.1`) and
+   the intermediate carries the WWDR marker OID (`1.2.840.113635.100.6.2.1`).
+4. The signature verifies against the leaf's public key using ES256.
+
+For App Store Server Notifications you should also assert the app identity so
+cross-app or cross-environment payloads are rejected:
+
+```ruby
+payload = AppStoreServerApi::Utils::Decoder.decode_notification(
+  signed_payload: signed_payload,
+  bundle_id: "com.myapp.app",
+  environment: :sandbox
+)
+```
+
+`bundle_id:` and `environment:` are also accepted by `decode_transaction`,
+`decode_transactions`, and `decode_jws!`, and are optional (verification of the
+signing chain always runs). A `AppStoreServerApi::Utils::Decoder::VerificationError`
+is raised when any check fails.
 
 ## License
 

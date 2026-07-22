@@ -4,6 +4,8 @@ require "base64"
 require "openssl"
 require "jwt"
 
+require_relative "../models"
+
 module AppStoreServerApi
   module Utils
     # Verifies and decodes the JWS (JSON Web Signature) payloads that Apple's
@@ -104,6 +106,69 @@ module AppStoreServerApi
           root_certificates: root_certificates
       end
 
+      # Verify an App Store Server Notification (signedPayload) AND its nested
+      # `data.signedTransactionInfo` / `data.signedRenewalInfo` JWS strings in a
+      # single call, mirroring the official libraries' `SignedDataVerifier`.
+      #
+      # The envelope's signature is verified (and bundleId/environment asserted
+      # when supplied); each nested JWS is independently verified against Apple's
+      # signing chain and decoded. The raw nested JWS strings are never returned
+      # — callers receive only decoded, verified data.
+      #
+      # @return [AppStoreServerApi::DecodedNotification]
+      def verify_and_decode_notification(signed_payload:, bundle_id: nil, environment: nil, root_certificates: nil)
+        payload = decode_jws!(signed_payload,
+          bundle_id: bundle_id,
+          environment: environment,
+          root_certificates: root_certificates)
+
+        data = payload["data"] || {}
+        summary = payload["summary"]
+        identity = data.empty? ? (summary || {}) : data
+
+        DecodedNotification.new(
+          notification_type: payload["notificationType"],
+          subtype: payload["subtype"],
+          notification_uuid: payload["notificationUUID"],
+          version: payload["version"],
+          environment: identity["environment"],
+          app_apple_id: identity["appAppleId"],
+          bundle_id: identity["bundleId"],
+          transaction_info: decode_nested(data["signedTransactionInfo"], root_certificates),
+          renewal_info: decode_nested(data["signedRenewalInfo"], root_certificates),
+          summary: summary
+        )
+      end
+
+      # Unpack a Get All Subscription Statuses response into verified, decoded
+      # structs. Each entry's nested `signedTransactionInfo` / `signedRenewalInfo`
+      # is verified against Apple's signing chain and decoded; the raw JWS
+      # strings are never returned.
+      #
+      # @param response [Hash] the parsed Get All Subscription Statuses response.
+      # @return [Array<AppStoreServerApi::SubscriptionStatus>] flattened across
+      #   all subscription groups.
+      def decode_subscription_statuses(response, root_certificates: nil)
+        groups = response.is_a?(Hash) ? (response["data"] || []) : []
+
+        groups.flat_map do |group|
+          group_id = group["subscriptionGroupIdentifier"]
+
+          (group["lastTransactions"] || []).map do |entry|
+            status = entry["status"]
+
+            SubscriptionStatus.new(
+              original_transaction_id: entry["originalTransactionId"],
+              status: status,
+              status_name: Status.name_for(status),
+              subscription_group_identifier: group_id,
+              transaction_info: decode_nested(entry["signedTransactionInfo"], root_certificates),
+              renewal_info: decode_nested(entry["signedRenewalInfo"], root_certificates)
+            )
+          end
+        end
+      end
+
       # The Apple root certificate(s) bundled with the gem. Only self-signed
       # roots are treated as trust anchors; bundled intermediates (e.g. WWDR)
       # are ignored so they cannot act as a root.
@@ -118,6 +183,16 @@ module AppStoreServerApi
       end
 
       # --- internal helpers -------------------------------------------------
+
+      # Verify and decode a nested JWS (a transaction/renewal payload carried
+      # inside a notification or statuses response). Only the signing chain is
+      # verified here; the enclosing envelope already asserts app identity, and
+      # renewalInfo payloads carry no bundleId to assert against.
+      def decode_nested(jws, root_certificates)
+        return nil if jws.nil? || jws.empty?
+
+        decode_jws!(jws, root_certificates: root_certificates)
+      end
 
       def decode_without_verification(jws)
         JWT.decode(jws, nil, false)

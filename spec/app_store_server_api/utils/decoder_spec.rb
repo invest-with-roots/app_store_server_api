@@ -138,6 +138,136 @@ RSpec.describe AppStoreServerApi::Utils::Decoder do
     end
   end
 
+  describe "verify_and_decode_notification" do
+    it "verifies the envelope and extracts type/uuid and app identity" do
+      notification = described_class.verify_and_decode_notification(
+        signed_payload: read_jws.call("testNotification"),
+        bundle_id: "com.example",
+        environment: :sandbox,
+        root_certificates: [test_root]
+      )
+
+      expect(notification).to be_a(AppStoreServerApi::DecodedNotification)
+      expect(notification.notification_type).to eq("TEST")
+      expect(notification.notification_uuid).to eq("9ad56bd2-0bc6-42e0-af24-fd996d87a1e6")
+      expect(notification.bundle_id).to eq("com.example")
+      expect(notification.environment).to eq("Sandbox")
+      expect(notification.app_apple_id).to eq(1234)
+      expect(notification.transaction_info).to be_nil
+      expect(notification.renewal_info).to be_nil
+    end
+
+    it "rejects an envelope whose bundleId does not match" do
+      expect {
+        described_class.verify_and_decode_notification(
+          signed_payload: read_jws.call("wrongBundleId"),
+          bundle_id: "com.example",
+          root_certificates: [test_root]
+        )
+      }.to raise_error(described_class::VerificationError, /bundleId/)
+    end
+
+    it "verifies and decodes the nested transaction and renewal JWS, exposing no raw strings" do
+      tx_jws = read_jws.call("transactionInfo")
+      renewal_jws = read_jws.call("renewalInfo")
+
+      # Substitute the envelope decode (we have no signing key to mint a nested
+      # envelope fixture) while the nested JWS are verified for real.
+      allow(described_class).to receive(:decode_jws!).and_wrap_original do |orig, jws, **opts|
+        if jws == "ENVELOPE"
+          {
+            "notificationType" => "DID_RENEW",
+            "subtype" => "BILLING_RECOVERY",
+            "notificationUUID" => "uuid-1",
+            "version" => "2.0",
+            "data" => {
+              "environment" => "Sandbox",
+              "bundleId" => "com.example",
+              "appAppleId" => 1234,
+              "signedTransactionInfo" => tx_jws,
+              "signedRenewalInfo" => renewal_jws
+            }
+          }
+        else
+          orig.call(jws, **opts)
+        end
+      end
+
+      notification = described_class.verify_and_decode_notification(
+        signed_payload: "ENVELOPE",
+        root_certificates: [test_root]
+      )
+
+      expect(notification.notification_type).to eq(AppStoreServerApi::NotificationTypeV2::DID_RENEW)
+      expect(notification.subtype).to eq(AppStoreServerApi::Subtype::BILLING_RECOVERY)
+      expect(notification.transaction_info).to be_a(Hash)
+      expect(notification.transaction_info["bundleId"]).to eq("com.example")
+      expect(notification.renewal_info).to be_a(Hash)
+      expect(notification.renewal_info["environment"]).to eq("Sandbox")
+      # The raw nested JWS strings never surface on the struct.
+      expect(notification.to_h.values).not_to include(tx_jws)
+      expect(notification.to_h.values).not_to include(renewal_jws)
+    end
+  end
+
+  describe "decode_subscription_statuses" do
+    let(:tx_jws) { read_jws.call("transactionInfo") }
+    let(:renewal_jws) { read_jws.call("renewalInfo") }
+    let(:response) do
+      {
+        "environment" => "Sandbox",
+        "bundleId" => "com.example",
+        "data" => [
+          {
+            "subscriptionGroupIdentifier" => "20659145",
+            "lastTransactions" => [
+              {
+                "originalTransactionId" => "2000000",
+                "status" => 1,
+                "signedTransactionInfo" => tx_jws,
+                "signedRenewalInfo" => renewal_jws
+              }
+            ]
+          }
+        ]
+      }
+    end
+
+    it "unpacks each entry into a verified, decoded struct with a named status" do
+      statuses = described_class.decode_subscription_statuses(response, root_certificates: [test_root])
+
+      expect(statuses.length).to eq(1)
+      status = statuses.first
+      expect(status).to be_a(AppStoreServerApi::SubscriptionStatus)
+      expect(status.original_transaction_id).to eq("2000000")
+      expect(status.status).to eq(1)
+      expect(status.status_name).to eq(:active)
+      expect(status).to be_active
+      expect(status.subscription_group_identifier).to eq("20659145")
+      expect(status.transaction_info).to be_a(Hash)
+      expect(status.transaction_info["bundleId"]).to eq("com.example")
+      expect(status.renewal_info["environment"]).to eq("Sandbox")
+    end
+
+    it "exposes no raw nested JWS strings on the returned structs" do
+      status = described_class.decode_subscription_statuses(response, root_certificates: [test_root]).first
+
+      expect(status.to_h.values).not_to include(tx_jws)
+      expect(status.to_h.values).not_to include(renewal_jws)
+    end
+
+    it "raises when a nested transaction JWS fails verification" do
+      response["data"][0]["lastTransactions"][0]["signedTransactionInfo"] = "not.a.jws"
+
+      expect { described_class.decode_subscription_statuses(response, root_certificates: [test_root]) }
+        .to raise_error(described_class::VerificationError)
+    end
+
+    it "returns an empty array when the response has no data" do
+      expect(described_class.decode_subscription_statuses({}, root_certificates: [test_root])).to eq([])
+    end
+  end
+
   describe ".apple_root_cas" do
     it "returns only self-signed Apple roots (no bundled intermediates)" do
       roots = described_class.apple_root_cas

@@ -4,6 +4,9 @@ A Ruby client for the [App Store Server API](https://developer.apple.com/documen
 - Test notification and notification history endpoints
 - Automatic ES256 JWT authentication with token refresh
 - Helpers for decoding and verifying JWS payloads
+- Composed verified helpers (verified transaction fetch, deep notification decode, statuses unpack)
+- Named protocol constants (notification types/subtypes, subscription statuses)
+- Typed, actionable errors with automatic retry/backoff
 - Built-in trust chain validation against Apple Root CAs
 
 [![Gem Version](https://badge.fury.io/rb/app_store_server_api.svg)](https://badge.fury.io/rb/app_store_server_api)
@@ -21,6 +24,9 @@ A Ruby client for the [App Store Server API](https://developer.apple.com/documen
 * Test notification and notification history endpoints
 * Automatic ES256 JWT authentication with token refresh
 * Helpers for decoding and verifying JWS payloads
+* Composed verified helpers (verified transaction fetch, deep notification decode, statuses unpack)
+* Named protocol constants (notification types/subtypes, subscription statuses)
+* Typed, actionable errors with automatic retry/backoff
 * Built-in trust chain validation against Apple Root CAs
 
 ## Requirements
@@ -125,12 +131,88 @@ transaction = AppStoreServerApi::Utils::Decoder.decode_transaction signed_transa
 client.request_a_test_notification
 ```
 
+### Verified helpers
+
+These compose the raw endpoints with JWS verification so a caller receives
+fully verified, decoded data and never has to handle a raw JWS string.
+
+**Verified transaction fetch** — Get Transaction Info, then verify and decode
+the returned `signedTransactionInfo`:
+
+```ruby
+transaction = client.get_verified_transaction_info(transaction_id)
+transaction["originalTransactionId"]
+```
+
+**Verified notification decode** — verify the notification envelope *and* its
+nested `data.signedTransactionInfo` / `data.signedRenewalInfo`, mirroring the
+official libraries' `SignedDataVerifier`:
+
+```ruby
+notification = AppStoreServerApi::Utils::Decoder.verify_and_decode_notification(
+  signed_payload: signed_payload,
+  bundle_id: "com.myapp.app",
+  environment: :production
+)
+
+notification.notification_type   # e.g. AppStoreServerApi::NotificationTypeV2::DID_RENEW
+notification.subtype             # e.g. AppStoreServerApi::Subtype::BILLING_RECOVERY
+notification.transaction_info    # decoded, verified Hash (or nil)
+notification.renewal_info        # decoded, verified Hash (or nil)
+```
+
+**Verified subscription statuses** — Get All Subscription Statuses, then unpack
+the nested `lastTransactions` JWS arrays into verified structs with named
+statuses:
+
+```ruby
+statuses = client.get_verified_subscription_statuses(original_transaction_id)
+
+statuses.each do |s|
+  s.status            # Apple integer (see AppStoreServerApi::Status)
+  s.status_name       # :active / :expired / :billing_retry / :billing_grace_period / :revoked
+  s.transaction_info  # decoded, verified Hash
+  s.renewal_info      # decoded, verified Hash
+end
+```
+
+### Protocol constants
+
+Named constants mirror Apple's official enums so you branch on names, not magic
+values:
+
+- `AppStoreServerApi::NotificationTypeV2` — `SUBSCRIBED`, `DID_RENEW`,
+  `GRACE_PERIOD_EXPIRED`, `TEST`, … (`ALL` lists them).
+- `AppStoreServerApi::Subtype` — `INITIAL_BUY`, `GRACE_PERIOD`,
+  `BILLING_RETRY`, … (`ALL` lists them).
+- `AppStoreServerApi::Status` — `ACTIVE` (1) … `REVOKED` (5), plus
+  `Status.name_for(code)` for the symbol name.
+
+### Errors
+
+Client requests raise typed errors so callers can tell a bad request from an
+outage:
+
+- `AppStoreServerApi::TransactionIdNotFoundError` — Apple does not recognise the
+  transaction id (HTTP 404, errorCode 4040010).
+- `AppStoreServerApi::ClientError` — other 4xx responses.
+- `AppStoreServerApi::RateLimitExceededError` — HTTP 429.
+- `AppStoreServerApi::ServerError` — HTTP 5xx.
+- `AppStoreServerApi::NetworkError` — timeout / socket failure.
+
+All HTTP errors subclass `AppStoreServerApi::APIError` and expose
+`#http_status`, `#api_error_code`, and `#response_body`. Rate-limit, 5xx, and
+network failures also include `AppStoreServerApi::RetryableError` and are
+retried automatically with exponential backoff (`max_retries:` /
+`retry_base_delay:` on `Client.new`).
 
 **Utils**
 
 - AppStoreServerApi::Utils::Decoder.decode_transaction
 - AppStoreServerApi::Utils::Decoder.decode_transactions
 - AppStoreServerApi::Utils::Decoder.decode_notification
+- AppStoreServerApi::Utils::Decoder.verify_and_decode_notification
+- AppStoreServerApi::Utils::Decoder.decode_subscription_statuses
 - AppStoreServerApi::Utils::Decoder.decode_jws!
 
 ## JWS verification

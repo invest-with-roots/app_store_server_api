@@ -59,16 +59,27 @@ module AppStoreServerApi
       #   anchors; defaults to the bundled Apple root CA(s).
       # @return [Hash] the verified payload.
       # @raise [VerificationError] if verification fails.
-      def decode_jws!(jws, bundle_id: nil, environment: nil, root_certificates: nil)
+      # @param test_certificates [Array<OpenSSL::X509::Certificate>, nil]
+      #   certificates accepted as the sole signer of a payload: StoreKit
+      #   Testing in Xcode signs every transaction with one self-signed
+      #   certificate per Mac (header `x5c` of length 1, environment "Xcode"),
+      #   so a development server that wants to accept simulator purchases
+      #   trusts that exported certificate here. A payload whose single `x5c`
+      #   certificate byte-equals one of these is verified against it and the
+      #   Apple chain checks are skipped; anything else goes through the Apple
+      #   chain exactly as before. Never set this in production. Mirrors
+      #   Apple's App Store Server Library `Environment.XCODE`.
+      def decode_jws!(jws, bundle_id: nil, environment: nil, root_certificates: nil, test_certificates: nil)
         unverified_payload, header = decode_without_verification(jws)
 
         assert_algorithm!(header)
-        certificates = extract_certificates(header)
-        leaf = verify_certificate_chain!(
-          certificates,
-          effective_date: effective_date_for(unverified_payload),
-          root_certificates: root_certificates || apple_root_cas
-        )
+        effective_date = effective_date_for(unverified_payload)
+        leaf = matching_test_certificate(header, test_certificates, effective_date: effective_date) ||
+          verify_certificate_chain!(
+            extract_certificates(header),
+            effective_date: effective_date,
+            root_certificates: root_certificates || apple_root_cas
+          )
 
         payload, = JWT.decode(jws, leaf.public_key, true, algorithm: ALGORITHM)
 
@@ -79,19 +90,21 @@ module AppStoreServerApi
         raise VerificationError, "JWS verification failed: #{e.message}"
       end
 
-      def decode_transaction(signed_transaction:, bundle_id: nil, environment: nil, root_certificates: nil)
+      def decode_transaction(signed_transaction:, bundle_id: nil, environment: nil, root_certificates: nil, test_certificates: nil)
         decode_jws! signed_transaction,
           bundle_id: bundle_id,
           environment: environment,
-          root_certificates: root_certificates
+          root_certificates: root_certificates,
+          test_certificates: test_certificates
       end
 
-      def decode_transactions(signed_transactions:, bundle_id: nil, environment: nil, root_certificates: nil)
+      def decode_transactions(signed_transactions:, bundle_id: nil, environment: nil, root_certificates: nil, test_certificates: nil)
         signed_transactions.map do |signed_transaction|
           decode_transaction signed_transaction: signed_transaction,
             bundle_id: bundle_id,
             environment: environment,
-            root_certificates: root_certificates
+            root_certificates: root_certificates,
+            test_certificates: test_certificates
         end
       end
 
@@ -205,6 +218,27 @@ module AppStoreServerApi
         return if alg == ALGORITHM
 
         raise VerificationError, "Unexpected JWS algorithm: #{alg.inspect} (expected #{ALGORITHM})"
+      end
+
+      # The trusted test certificate this payload is signed with, or nil when
+      # the payload must take the Apple chain path: no test certificates were
+      # configured, the `x5c` header is not exactly one certificate, that
+      # certificate is not byte-identical to a trusted one, or the payload was
+      # signed outside the certificate's validity window.
+      def matching_test_certificate(header, test_certificates, effective_date:)
+        return nil if test_certificates.nil? || test_certificates.empty?
+
+        x5c = header["x5c"]
+        return nil unless x5c.is_a?(Array) && x5c.length == 1
+
+        presented = OpenSSL::X509::Certificate.new(Base64.decode64(x5c.first))
+        trusted = test_certificates.find { |certificate| certificate.to_der == presented.to_der }
+        return nil if trusted.nil?
+        return nil unless trusted.not_before <= effective_date && effective_date <= trusted.not_after
+
+        trusted
+      rescue OpenSSL::X509::CertificateError
+        nil
       end
 
       def extract_certificates(header)
